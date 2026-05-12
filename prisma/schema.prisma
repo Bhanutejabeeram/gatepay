@@ -1,0 +1,131 @@
+// GatePay — schema
+// Models the four core entities: channel owners, gated channels, paying subscribers, payments.
+// Postgres on Neon (or any Postgres-compatible host).
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// A Telegram user who owns one or more gated channels.
+model Owner {
+  id               String    @id @default(cuid())
+  telegramUserId   BigInt    @unique
+  telegramUsername String?
+  // Where SOL settlement lands. Filled during /setup.
+  settlementAddress String?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  channels Channel[]
+}
+
+// Tracks channels where the bot has been promoted to admin but the owner hasn't
+// finished /setup yet. Persisted (not in-memory) so a server restart doesn't lose
+// pending setups. Removed when the corresponding Channel row is created.
+model PendingChannel {
+  id              String   @id @default(cuid())
+  telegramUserId  BigInt
+  telegramChatId  BigInt   @unique
+  channelTitle    String?
+  createdAt       DateTime @default(now())
+
+  @@index([telegramUserId])
+}
+
+// A private Telegram channel gated behind payment.
+model Channel {
+  id               String    @id @default(cuid())
+  // Public slug used in subscribe URL: /c/<slug>
+  slug             String    @unique
+  title            String
+  description      String?
+  // Telegram chat ID of the private channel (negative integer for channels).
+  telegramChatId   BigInt    @unique
+  // Settlement target — copied from Owner at creation, override per channel if needed.
+  settlementChainId       String  @default("sol")
+  settlementTokenAddress  String  @default("SOL")
+  settlementAddress       String
+  priceUsd         Float
+  durationDays     Int
+  active           Boolean   @default(true)
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  ownerId       String
+  owner         Owner          @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  subscriptions Subscription[]
+  payments      Payment[]
+
+  @@index([ownerId])
+}
+
+// One row per (channel, telegram user). Re-used across renewals — expiresAt is bumped on each successful payment.
+model Subscription {
+  id                       String    @id @default(cuid())
+  channelId                String
+  subscriberTelegramUserId BigInt
+  // null until first successful payment
+  startedAt                DateTime?
+  expiresAt                DateTime?
+  // Most recent invite link issued (one-time, member_limit=1)
+  lastInviteLink           String?
+  // True once the bot has confirmed the user joined and we should kick them on expiry.
+  isMember                 Boolean   @default(false)
+  // Set true once we DM a renewal reminder for the current cycle to avoid spam.
+  renewalReminderSent      Boolean   @default(false)
+  createdAt                DateTime  @default(now())
+  updatedAt                DateTime  @updatedAt
+
+  channel  Channel   @relation(fields: [channelId], references: [id], onDelete: Cascade)
+  payments Payment[]
+
+  @@unique([channelId, subscriberTelegramUserId])
+  @@index([expiresAt])
+}
+
+enum PaymentStatus {
+  pending
+  succeeded
+  failed
+  refunded
+}
+
+// One payment attempt — created when we generate a KIRAPAY link, advanced on webhook.
+model Payment {
+  id              String        @id @default(cuid())
+  // The customOrderId we send to KIRAPAY: "{telegramUserId}:{channelId}:{durationDays}"
+  customOrderId   String        @unique
+  kirapayLinkCode String?       @unique
+  kirapayLinkUrl  String?
+  // KIRAPAY's transaction _id, populated on webhook
+  kirapayTxId     String?       @unique
+  // On-chain hash from the source chain
+  sourceChainHash String?
+  amountUsd       Float
+  settlementAmount Float?
+  status          PaymentStatus @default(pending)
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  channelId                String
+  subscriberTelegramUserId BigInt
+  // Captured at link-creation time so the owner notification can show who subscribed.
+  subscriberUsername       String?
+  subscriberDisplayName    String?
+  // The Telegram message ID we sent containing the "Pay with KIRAPAY" button.
+  // Cleared after a successful subscription so the bot can delete stale buttons.
+  payMessageId             Int?
+  subscriptionId           String?
+  durationDays             Int
+
+  channel      Channel       @relation(fields: [channelId], references: [id], onDelete: Cascade)
+  subscription Subscription? @relation(fields: [subscriptionId], references: [id], onDelete: SetNull)
+
+  @@index([channelId])
+  @@index([subscriberTelegramUserId])
+}
